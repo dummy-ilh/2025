@@ -1,0 +1,151 @@
+import openai
+import pandas as pd
+import yaml
+import json
+from pathlib import Path
+from tqdm import tqdm
+
+# ✅ OpenAI setup (edit with your values)
+openai.api_type = "azure"
+openai.api_base = "https://your-endpoint.openai.azure.com/"
+openai.api_version = "2024-05-01"
+openai.api_key = "your-token"
+MODEL_NAME = "gpt-4o"
+
+BATCH_SIZE = 25
+processed_examples = []
+
+# ✅ Load prompt
+with open("prompts.yaml", "r") as f:
+    prompts = yaml.safe_load(f)
+current_prompt = prompts["current_prompt"]
+
+# ✅ Load data
+complaints = pd.read_csv("complaints.csv")
+non_complaints = pd.read_csv("non_complaints.csv")
+complaints["label"] = "Complaint"
+non_complaints["label"] = "Non-Complaint"
+data = pd.concat([complaints, non_complaints]).sample(frac=1).reset_index(drop=True)
+
+# ✅ LLM call
+def call_llm(messages):
+    response = openai.ChatCompletion.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.2
+    )
+    return response["choices"][0]["message"]["content"].strip()
+
+def classify(text, prompt):
+    full_prompt = prompt.replace("{input}", text)
+    messages = [
+        {"role": "system", "content": "You are a complaint classifier."},
+        {"role": "user", "content": full_prompt}
+    ]
+    return call_llm(messages)
+
+def accuracy_on(data, prompt):
+    correct = 0
+    for ex in data:
+        pred = classify(ex["text"], prompt)
+        if pred.lower() == ex["label"].lower():
+            correct += 1
+    return correct / len(data)
+
+def prompt_updater(old_prompt, failed):
+    fail_block = "\n".join(f'Input: "{f["text"]}", Label: "{f["label"]}", Predicted: "{f["prediction"]}"' for f in failed)
+    messages = [
+        {"role": "system", "content": "You optimize classification prompts."},
+        {"role": "user", "content": f"""Improve this prompt:
+
+--- Prompt ---
+{old_prompt}
+--------------
+
+It failed on:
+{fail_block}
+
+Please return a new, improved prompt.
+"""}
+    ]
+    return call_llm(messages)
+
+def prompt_revisor(old_prompt, failed_prompt, failed_cases):
+    fail_block = "\n".join(f'Input: "{f["text"]}", Label: "{f["label"]}", Predicted: "{f["prediction"]}"' for f in failed_cases)
+    messages = [
+        {"role": "system", "content": "You are a prompt engineer improving your last revision."},
+        {"role": "user", "content": f"""We had two prompts:
+
+Prompt P1 (original):\n{old_prompt}\n
+Prompt P2 (updated):\n{failed_prompt}\n
+
+Prompt P2 failed these cases:
+{fail_block}
+
+Please generate a smarter prompt (P3) that keeps the strengths of P1 and improves P2's weak spots.
+Return only the new prompt.
+"""}
+    ]
+    return call_llm(messages)
+
+# ✅ Run batches
+Path("logs").mkdir(exist_ok=True)
+
+for i in range(0, len(data), BATCH_SIZE):
+    batch = data.iloc[i:i+BATCH_SIZE]
+    batch_failed = []
+
+    print(f"\n🚀 Batch {i // BATCH_SIZE + 1}")
+    for _, row in tqdm(batch.iterrows(), total=len(batch)):
+        prediction = classify(row["text"], current_prompt)
+        processed_examples.append({
+            "text": row["text"],
+            "label": row["label"],
+        })
+        if prediction.lower() != row["label"].lower():
+            batch_failed.append({
+                "text": row["text"],
+                "label": row["label"],
+                "prediction": prediction
+            })
+
+    # ✅ If batch has errors → try updating prompt
+    if batch_failed:
+        print(f"❌ {len(batch_failed)} failures. Updating prompt...")
+        candidate_prompt = prompt_updater(current_prompt, batch_failed)
+
+        acc_old = accuracy_on(processed_examples, current_prompt)
+        acc_new = accuracy_on(processed_examples, candidate_prompt)
+
+        print(f"📊 Accuracy: Old={acc_old:.2%}, New={acc_new:.2%}")
+
+        # ✅ If new prompt is worse, try again with feedback
+        if acc_new < acc_old:
+            print("⚠️ New prompt failed. Sending feedback to generate Prompt P3...")
+            revised_prompt = prompt_revisor(current_prompt, candidate_prompt, batch_failed)
+            acc_revised = accuracy_on(processed_examples, revised_prompt)
+            print(f"📊 Revised Accuracy: {acc_revised:.2%}")
+
+            if acc_revised >= acc_old:
+                print("✅ Using revised prompt.")
+                current_prompt = revised_prompt
+            else:
+                print("🛑 Keeping old prompt. Discarding both P2 and P3.")
+        else:
+            print("✅ New prompt accepted.")
+            current_prompt = candidate_prompt
+
+        # ✅ Save prompt
+        prompts["current_prompt"] = current_prompt
+        with open("prompts.yaml", "w") as f:
+            yaml.dump(prompts, f)
+
+        # ✅ Log failed
+        with open("logs/failed_examples.json", "a") as f:
+            json.dump(batch_failed, f)
+            f.write("\n")
+---------------
+
+current_prompt: |
+  Classify this message as "Complaint" or "Non-Complaint".
+  Message: {input}
